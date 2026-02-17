@@ -1,164 +1,181 @@
 import ccxt
 import sys
-
-from random import choice
-from PySide6.QtGui import QAction
-from PySide6.QtCore import QSize, Qt, QThread
+from PySide6.QtGui import QAction, QFont, QIcon
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (QApplication, QWidget, QPushButton,
                                QMainWindow, QLineEdit, QVBoxLayout,
-                               QLabel, QMenu)
-# crypto
+                               QLabel, QMenu, QMessageBox, QTextEdit, 
+                               QFrame, QHBoxLayout)
 
-class VoidCrypto:
-    def __init__(self):   
-        super().__init__()
-        #self.crypto_data = VoidCrypto()
-        #self.sembol = sembol  # bu sekilde istenilen kripto para bilgileri ekrana getirilebilir
-    #BTC 
-        exchange = ccxt.binance()
-        ticker = exchange.fetch_ticker('BTC/USDT')
-        print("BTC/USDT")
-        print(f"Last Price: {ticker['last']}")
-        print(f"Buy: (Bid): {ticker['bid']}")  
-        print(f"Sell: (Ask): {ticker['ask']}") 
-        print(f"Max Value: {ticker['quoteVolume']}")
+#css 
+DARK_STYLE = """
+QMainWindow {
+    background-color: #121212;
+}
+QWidget {
+    background-color: #121212;
+    color: #E0E0E0;
+    font-family: 'Segoe UI', Arial;
+}
+QLineEdit {
+    background-color: #1E1E1E;
+    border: 2px solid #333333;
+    border-radius: 8px;
+    padding: 10px;
+    color: white;
+    font-size: 13px;
+}
+QLineEdit:focus {
+    border: 2px solid #F3BA2F;
+}
+QPushButton {
+    background-color: #F3BA2F;
+    color: #000000;
+    border-radius: 8px;
+    font-weight: bold;
+    font-size: 14px;
+    padding: 12px;
+}
+QPushButton:hover {
+    background-color: #FFD56B;
+}
+QPushButton:pressed {
+    background-color: #C79820;
+}
+QTextEdit {
+    background-color: #0A0A0A;
+    border: 1px solid #333333;
+    border-radius: 8px;
+    color: #00FF00;
+    font-family: 'Consolas', 'Courier New';
+    font-size: 12px;
+}
+QLabel#Title {
+    color: #F3BA2F;
+    font-size: 22px;
+    font-weight: bold;
+}
+"""
 
-        print("====================================================")
-    #GALA
-        print("GALA/USDT")
-        ticker = exchange.fetch_ticker('GALA/USDT')
-        print(f"Last Price: {ticker['last']}")
-        print(f"Buy: (Bid): {ticker['bid']}")  
-        print(f"Sell: (Ask): {ticker['ask']}") 
-        print(f"Max Value: {ticker['quoteVolume']}")
-
-        print("====================================================")
-    #ACH
-        print("ACH/USDT")
-        ticker = exchange.fetch_ticker('ACH/USDT')
-        print(f"Last Price: {ticker['last']}")
-        print(f"Buy: (Bid): {ticker['bid']}")  
-        print(f"Sell: (Ask): {ticker['ask']}") 
-        print(f"Max Value: {ticker['quoteVolume']}")
-
-# ui
-window_titles = [
-    "My App",
-    "My App",
-    "Still My App",
-    "Still My App",
-    "What on earth",
-    "What on earth",
-    "This is surprising",
-    "This is surprising",
-    "Something went wrong",
-]
-
-class MainWindow(QMainWindow):
+class BinanceApp(QMainWindow):
     def __init__(self):
         super().__init__()
+
+        self.setWindowTitle("VoidCrypto v1.0")
+        self.setFixedSize(480, 600)
+        self.setStyleSheet(DARK_STYLE)
+
+        # Ana Widget ve Layout
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QVBoxLayout(self.central_widget)
+        self.main_layout.setSpacing(15)
+        self.main_layout.setContentsMargins(25, 25, 25, 25)
+
+        # --- Üst Başlık ---
+        self.label_title = QLabel("VoidCrypto")
+        self.label_title.setObjectName("Title")
+        self.label_title.setAlignment(Qt.AlignCenter)
         
-        self.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.customContextMenuRequested.connect(self.on_context_menu)
-        #mouseevent
-        self.setMouseTracking(True)
-        self.label = QLabel("Click in this window")
-        self.label.setMouseTracking(True)
-        self.setCentralWidget(self.label)
-        #pencere
-        self.setWindowTitle("VoidCrypto")
-        self.setFixedSize(QSize(400, 300))
-        self.n_times_clicked = 0
-        self.label = QLabel("Click in this window")
+        self.status_label = QLabel("Bağlantı Bekleniyor...")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setStyleSheet("color: #888888; font-size: 11px;")
 
-        #
-        self.setCentralWidget(self.label)
+        # --- Giriş Alanları Çerçevesi ---
+        self.setup_ui_elements()
 
-        button = QPushButton("Press Me!")
-        button.clicked.connect(self.the_button_was_clicked)
-        button.clicked.connect(self.the_button_was_toggled)
-        self.setCentralWidget(button) # pencereyi merkeze koyar
+        # --- Log Ekranı ---
+        self.log_screen = QTextEdit()
+        self.log_screen.setReadOnly(True)
+        self.log_screen.setPlaceholderText("Sistem mesajları burada görünecek...")
 
-        self.windowTitleChanged.connect(self.the_window_title_changed)
-     #Label
-        self.input = QLineEdit()
-        self.input.textChanged.connect(self.label.setText)  
-        layout = QVBoxLayout()
-        layout.addWidget(self.input)
-        layout.addWidget(self.label) 
-    def the_button_was_clicked(self):
-        print("Clicked.")
-        new_window_title = choice(window_titles)
-        print("Setting title:  %s" % new_window_title)
-        self.setWindowTitle(new_window_title)
+        # Yerleştirme
+        self.main_layout.addWidget(self.label_title)
+        self.main_layout.addWidget(self.status_label)
+        self.main_layout.addWidget(self.create_input_group("API KEY", self.api_key_input))
+        self.main_layout.addWidget(self.create_input_group("SECRET KEY", self.secret_key_input))
+        self.main_layout.addSpacing(10)
+        self.main_layout.addWidget(self.btn_connect)
+        self.main_layout.addWidget(QLabel("İşlem Logları:"))
+        self.main_layout.addWidget(self.log_screen)
 
-    def the_window_title_changed(self, window_title):
-        print("Window title changed: %s" % window_title)
-        if window_title == "Something went wrong":
-            self.button.setDisabled(True)
+    def setup_ui_elements(self):
+        # API Key Girişi
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setPlaceholderText("Binance API Key...")
+        
+        # Secret Key Girişi
+        self.secret_key_input = QLineEdit()
+        self.secret_key_input.setPlaceholderText("Binance Secret Key...")
+        self.secret_key_input.setEchoMode(QLineEdit.Password)
 
-    def the_button_was_toggled(self, checked):
-        print("Checked?", checked)
+        # Bağlan Butonu
+        self.btn_connect = QPushButton("BAĞLANTIYI TEST ET")
+        self.btn_connect.setCursor(Qt.PointingHandCursor)
+        self.btn_connect.clicked.connect(self.connect_binance)
 
-    def the_button_was_released(self):
-        self.button_is_checked = self.button.isChecked()
+    def create_input_group(self, label_text, widget):
+        group_widget = QWidget()
+        layout = QVBoxLayout(group_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        
+        lbl = QLabel(label_text)
+        lbl.setStyleSheet("font-weight: bold; color: #F3BA2F; font-size: 11px;")
+        
+        layout.addWidget(lbl)
+        layout.addWidget(widget)
+        return group_widget
 
-    #mouseEvent
-    def mouseMoveEvent(self, e):
-        self.label.setText("mouseMoveEvent")
+    def connect_binance(self):
+        api = self.api_key_input.text().strip()
+        sec = self.secret_key_input.text().strip()
 
-    def mousePressEvent(self, e):
-        self.label.setText("mousePressEvent")
+        if not api or not sec:
+            QMessageBox.critical(self, "Hata", "API bilgileri eksik!")
+            return
 
-    def mouseReleaseEvent(self, e):
-        self.label.setText("mouseReleaseEvent")
+        self.log_screen.clear()
+        self.log_screen.append("<span style='color: white;'>[SİSTEM]</span> Bağlantı deneniyor...")
+        self.status_label.setText("Bağlanıyor...")
 
-    def mouseDoubleClickEvent(self, e):
-        self.label.setText("mouseDoubleClickEvent")
+        try:
+            exchange = ccxt.binance({
+                'apiKey': api,
+                'secret': sec,
+                'enableRateLimit': True
+            })
+
+            # Bakiye çekme testi
+            balance = exchange.fetch_balance()
+            
+            self.log_screen.append("<span style='color: #00FF00;'>[BAŞARILI]</span> Binance bağlantısı doğrulandı.")
+            self.log_screen.append("-" * 30)
+            
+            has_funds = False
+            for asset, total in balance['total'].items():
+                if total > 0:
+                    self.log_screen.append(f"<b>{asset}</b>: {total}")
+                    has_funds = True
+            
+            if not has_funds:
+                self.log_screen.append("Cüzdanda varlık bulunamadı.")
+            
+            self.log_screen.append("-" * 30)
+            self.status_label.setText("Bağlantı Aktif")
+            self.status_label.setStyleSheet("color: #00FF00; font-size: 11px;")
+
+        except Exception as e:
+            self.log_screen.append(f"<span style='color: #FF0000;'>[HATA]</span> {str(e)}")
+            self.status_label.setText("Bağlantı Hatası!")
+            self.status_label.setStyleSheet("color: #FF0000; font-size: 11px;")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
     
-    #istenilen fonksiyonun özelliğini alır ama orijinalliğini korur.
-    #sonradan içeriye yazdığımız kodu da aldığımız kodu çalıştırır.
-    def mousePressEvent(self, event):
-        print("Mouse pressed!")
-        super().mousePressEvent(event)    
-
-    #contextMenu
-    def on_context_menu(self, pos):
-        context = QMenu(self)
-        context.addAction(QAction("test 1", self))
-        context.addAction(QAction("test 2", self))
-        context.addAction(QAction("test 3", self))
-        context.exec(self.mapToGlobal(pos))
-
-    def contextMenuEvent(self, e):
-        context = QMenu(self)
-        context.addAction(QAction("test 1", self))
-        context.addAction(QAction("test 2", self))
-        context.addAction(QAction("test 3", self))
-        context.exec(e.globalPos())    
-
-        print(self.button_is_checked)
-# wallet
-class KriptoCuzdan:
-    pass
-    def __init__(self, cüzdan_adi, bakiye):
-        # Dışarıdan gelen verileri nesnenin içine 'mühürlüyoruz'
-        self.name = cüzdan_adi 
-        self.balance = bakiye
-
-    def bilgileri_goster(self):
-        # self sayesinde bu verilere her yerden ulaşabiliriz
-        print(f"Cüzdan: {self.name}, Bakiye: {self.balance}")
-
-# Nesneyi oluştururken verileri gönderiyoruz
-cuzdan1 = KriptoCuzdan("Ana Cuzdan", 1500)
-cuzdan1.bilgileri_goster()
-
-
-app = QApplication(sys.argv)
-VoidCrypto()
-window = MainWindow()
-window.show()
-
-app.exec()
-
+    font = QFont("Segoe UI", 10)
+    app.setFont(font)
+    
+    window = BinanceApp()
+    window.show()
+    sys.exit(app.exec())
