@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  redis-db:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    restart: always
+  rabbitmq-broker:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    restart: always
+  data-fetcher:
+    build: .
+    command: python data_pipelines/data_fetcher.py
+    depends_on:
+      - redis-db
+    restart: unless-stopped
+    environment:
+      - REDIS_HOST=redis-db
+  feature-engine:
+    build: .
+    command: python data_pipelines/feature_engine.py
+    depends_on:
+      - redis-db
+    restart: unless-stopped
+    environment:
+      - REDIS_HOST=redis-db
+  event-router:
+    build: .
+    command: python data_pipelines/event_router.py
+    depends_on:
+      - redis-db
+      - rabbitmq-broker
+    restart: unless-stopped
+    environment:
+      - REDIS_HOST=redis-db
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq-broker/
+  master-ai:
+    build: .
+    command: python agents/agent_consumer.py
+    depends_on:
+      - rabbitmq-broker
+      - redis-db
+    restart: unless-stopped
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq-broker/
+      - REDIS_HOST=redis-db

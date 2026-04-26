@@ -1,9 +1,3 @@
-"""
-VOID ORCHESTRATOR — DIAGNOSTİK ARAÇ
-Her filtrenin kaç satırı elediğini tek tek gösterir.
-Bu scripti çalıştır, çıktıyı bana yapıştır.
-"""
-
 import pandas as pd
 import numpy as np
 import xgboost as xgb
