@@ -1,50 +1,134 @@
-version: '3.8'
-
 services:
-  redis-db:
-    image: redis:alpine
+  # ---------------------------------------------------------
+  # 1. ALTYAPI: REDIS & RABBITMQ
+  # ---------------------------------------------------------
+  redis-service:
+    image: redis:7-alpine
+    container_name: voidcrypto-redis
     ports:
       - "6379:6379"
     restart: always
-  rabbitmq-broker:
-    image: rabbitmq:3-management
+
+  rabbitmq-service:
+    image: rabbitmq:3-management-alpine
+    container_name: voidcrypto-rabbitmq
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Yönetim Arayüzü (guest/guest)
     restart: always
-  data-fetcher:
+
+  # ---------------------------------------------------------
+  # 2. SÜREKLİ ÇALIŞAN (CONTINUOUS) AJANLAR
+  # ---------------------------------------------------------
+  order-book-ai:
     build: .
-    command: python data_pipelines/data_fetcher.py
+    platform: linux/amd64
+    container_name: voidcrypto-order-book
+    command: python -u agents/order_book_ai.py
     depends_on:
-      - redis-db
-    restart: unless-stopped
+      - redis-service
+      - rabbitmq-service
+    ports:
+      - "8001:8001"
     environment:
-      - REDIS_HOST=redis-db
-  feature-engine:
+      - REDIS_URL=redis://redis-service:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq-service:5672/
+      - METRICS_PORT=8001
+      - SYMBOL=btcusdt
+      - TRIGGER_COOLDOWN_S=5.0
+    restart: always
+
+  ta-ai:
     build: .
-    command: python data_pipelines/feature_engine.py
+    platform: linux/amd64
+    container_name: voidcrypto-ta
+    command: python -u agents/ta_ai.py
     depends_on:
-      - redis-db
-    restart: unless-stopped
+      - redis-service
+      - rabbitmq-service
     environment:
-      - REDIS_HOST=redis-db
-  event-router:
+      - REDIS_URL=redis://redis-service:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq-service:5672/
+      - RABBITMQ_QUEUE=market_alerts
+      - SYMBOL=BTCUSDT
+    restart: always
+
+  # ---------------------------------------------------------
+  # 3. İSTİHBARAT (JOB & WORKER) AJANLARI
+  # ---------------------------------------------------------
+  whale-tracker-ai:
     build: .
-    command: python data_pipelines/event_router.py
+    platform: linux/amd64
+    container_name: voidcrypto-whale
+    command: python -u agents/whale_tracker_ai.py
     depends_on:
-      - redis-db
-      - rabbitmq-broker
-    restart: unless-stopped
+      - redis-service
+      - rabbitmq-service
     environment:
-      - REDIS_HOST=redis-db
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq-broker/
+      - REDIS_URL=redis://redis-service:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq-service:5672/
+      - RABBITMQ_QUEUE=market_alerts
+      - WHALE_API_KEY=${WHALE_API_KEY}
+      - WATCHED_SYMBOLS=["BTC","ETH","SOL"]
+    restart: on-failure
+
+  news-worker:
+    build: .
+    platform: linux/amd64
+    container_name: voidcrypto-news-worker
+    command: python -u agents/news_ai.py
+    depends_on:
+      - redis-service
+    environment:
+      - REDIS_URL=redis://redis-service:6379/0
+      - RUN_MODE=once 
+    restart: on-failure
+
+  # ---------------------------------------------------------
+  # 4. MAKİNE ÖĞRENMESİ (ML) AJANLARI
+  # ---------------------------------------------------------
+  ml-price-action-ai:
+    build: .
+    platform: linux/amd64
+    container_name: voidcrypto-ml-price
+    command: python -u agents/ml_priceaction_ai.py
+    depends_on:
+      - redis-service
+    environment:
+      - REDIS_URL=redis://redis-service:6379/0
+      - MODEL_LONG_PATH=/app/models/ml_action_long.json
+      - MODEL_SHORT_PATH=/app/models/ml_action_short.json
+    restart: always
+
+  # ---------------------------------------------------------
+  # 5. KARAR VE İCRA (MASTER & RISK) AJANLARI
+  # ---------------------------------------------------------
   master-ai:
     build: .
-    command: python agents/agent_consumer.py
+    platform: linux/amd64
+    container_name: voidcrypto-master
+    command: python -u agents/master_decision_ai.py
     depends_on:
-      - rabbitmq-broker
-      - redis-db
-    restart: unless-stopped
+      - redis-service
+      - rabbitmq-service
+    ports:
+      - "9090:9090"
     environment:
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq-broker/
-      - REDIS_HOST=redis-db
+      - REDIS_URL=redis://redis-service:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq-service:5672/
+      - CONSUME_QUEUE=market_alerts
+      - METRICS_PORT=9090
+    restart: always
+
+  risk-execution-ai:
+    build: .
+    platform: linux/amd64
+    container_name: voidcrypto-risk
+    command: python -u agents/risk_agent.py
+    depends_on:
+      - redis-service
+    environment:
+      - REDIS_URL=redis://redis-service:6379/0
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_SECRET=${BINANCE_SECRET}
+    restart: always

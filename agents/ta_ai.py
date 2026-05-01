@@ -1,211 +1,389 @@
 import asyncio
+import json
+import logging
+import os
+import time
+import aio_pika
 import aiohttp
 import pandas as pd
 import pandas_ta as ta
+import redis.asyncio as redis
+
+from typing import Optional
 from pydantic import BaseModel, Field
+from __future__ import annotations
 
-# ---------------------------------------------------------
-# 1. PAYLOAD MİMARİSİ (Master AI & Risk AI Entegrasyonu)
-# ---------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":%(message)s}',
+)
+logger = logging.getLogger("TA_AI")
+
 class TAConsensusPayload(BaseModel):
-    symbol: str = Field(..., description="İşlem çifti, örn: BTCUSDT")
-    timeframe: str = Field(..., description="Zaman dilimi, örn: 15m")
-    signal: int = Field(..., description="1: Valid Entry (Long/Short), 0: No Trade")
-    confidence: float = Field(..., description="0.0 - 1.0 arası katman onay skoru")
-    adx_value: float = Field(..., description="Trendin mevcut gücü")
-    active_layers: int = Field(..., description="Onay veren katman sayısı")
-    atr_volatility: float = Field(..., description="Risk AI'ın deterministik OCO/Trailing Stop hesabı için ham metrik")
+    symbol: str = Field(..., description="Trading pair, e.g. BTCUSDT")
+    timeframe: str = Field(..., description="Candle interval, e.g. 15m")
+    signal: int = Field(..., description="1 = Valid Entry, 0 = No Trade")
+    confidence: float = Field(..., description="Layer approval ratio [0.0 – 1.0]")
+    adx_value: float = Field(..., description="Current ADX — trend strength gate")
+    active_layers: int = Field(..., description="Number of layers that approved signal")
+    atr_volatility: float = Field(..., description="Raw ATR % — consumed by Risk AI for OCO/Trailing Stop sizing")
 
-# ---------------------------------------------------------
-# 2. ASYNC YAHOO FINANCE DATA PROVIDER (I/O Optimization)
-# ---------------------------------------------------------
+
+class MLFeatureVector(BaseModel):
+    dist_ema9: float    # (close - EMA9) / close
+    dist_ema21: float   # (close - EMA21) / close
+    dist_ema50: float   # (close - EMA50) / close
+    dist_ema200: float  # (close - EMA200) / close
+    macd_hist_pct: float   # MACD histogram / close
+    macd_line_pct: float   # MACD line / close
+    atr_pct: float         # ATR / close  (same as atr_volatility in payload)
+    rsi: float             # RSI [0–100], already dimensionless
+    obv_roc: float         # OBV rate-of-change over 14 periods
+    volume_roc: float      # Volume rate-of-change over 14 periods
+    bb_width_pct: float    # (BBU - BBL) / BBM  — squeeze proxy
+    adx: float             # ADX [0–100]
+    vwap_dist: float       # (close - VWAP) / close
+    msb_bullish: int       # 1 / 0 — Market Structure Break flag
+
 class YahooFinanceAsyncProvider:
     HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     BASE_URL = "https://query2.finance.yahoo.com/v8/finance/chart/"
 
-    @staticmethod
-    def map_symbol(symbol: str) -> str:
-        if symbol.endswith("USDT"):
-            return symbol.replace("USDT", "-USD")
-        return symbol
+    _RANGE_MAP: dict[str, str] = {
+        "1m": "1d",
+        "5m": "5d",
+        "15m": "5d",
+        "30m": "10d",
+        "1h": "1mo",
+        "1d": "1y",
+    }
 
     @staticmethod
-    def determine_range(interval: str) -> str:
-        # EMA 200 ve Market Structure geriye dönük hesaplamaları için güvenli minimum data aralıkları
-        range_map = {
-            "1m": "1d",
-            "5m": "5d",
-            "15m": "5d",
-            "30m": "10d",
-            "1h": "1mo",
-            "1d": "1y"
-        }
-        return range_map.get(interval, "1mo")
+    def map_symbol(symbol: str) -> str:
+        return symbol.replace("USDT", "-USD") if symbol.endswith("USDT") else symbol
+
+    def determine_range(self, interval: str) -> str:
+        return self._RANGE_MAP.get(interval, "1mo")
 
     async def fetch_ohlcv(self, symbol: str, interval: str = "15m") -> pd.DataFrame:
         yf_symbol = self.map_symbol(symbol)
         range_str = self.determine_range(interval)
         url = f"{self.BASE_URL}{yf_symbol}?interval={interval}&range={range_str}"
 
-        async with aiohttp.ClientSession(headers=self.HEADERS) as session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    return pd.DataFrame()
-                data = await response.json()
-                return self._parse_yf_response(data)
-
-    def _parse_yf_response(self, data: dict) -> pd.DataFrame:
         try:
-            result = data['chart']['result'][0]
-            timestamps = result['timestamp']
-            indicators = result['indicators']['quote'][0]
+            async with aiohttp.ClientSession(headers=self.HEADERS) as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status != 200:
+                        logger.warning(f'"event":"FETCH_FAILED","symbol":"{symbol}","http_status":{response.status}')
+                        return pd.DataFrame()
+                    raw = await response.json()
+                    return self._parse(raw)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.error(f'"event":"FETCH_EXCEPTION","symbol":"{symbol}","error":"{exc}"')
+            return pd.DataFrame()
 
-            df = pd.DataFrame({
-                'timestamp': pd.to_datetime(timestamps, unit='s'),
-                'open': indicators['open'],
-                'high': indicators['high'],
-                'low': indicators['low'],
-                'close': indicators['close'],
-                'volume': indicators['volume']
-            })
-            
-            df.dropna(subset=['close'], inplace=True)
-            df.set_index('timestamp', inplace=True)
-            df['volume'] = df['volume'].astype(float)
+    @staticmethod
+    def _parse(data: dict) -> pd.DataFrame:
+        try:
+            result = data["chart"]["result"][0]
+            quote = result["indicators"]["quote"][0]
+            df = pd.DataFrame(
+                {
+                    "timestamp": pd.to_datetime(result["timestamp"], unit="s"),
+                    "open": quote["open"],
+                    "high": quote["high"],
+                    "low": quote["low"],
+                    "close": quote["close"],
+                    "volume": quote["volume"],
+                }
+            )
+            df.dropna(subset=["close"], inplace=True)
+            df.set_index("timestamp", inplace=True)
+            df["volume"] = df["volume"].astype(float)
             return df
         except (KeyError, TypeError, IndexError):
             return pd.DataFrame()
 
-# ---------------------------------------------------------
-# 3. TECHNICAL ANALYSIS AGENT CORE (Vectorized Logic)
-# ---------------------------------------------------------
 class TechnicalAnalysisAgent:
-    def __init__(self, adx_threshold: int = 20, min_layer_approval: int = 3, msb_window: int = 20):
+    MIN_ROWS = 210  # EMA200 needs ≥200 rows; add buffer
+
+    def __init__(
+        self,
+        adx_threshold: int = 20,
+        min_layer_approval: int = 3,
+        msb_window: int = 20,
+    ) -> None:
         self.adx_threshold = adx_threshold
         self.min_layer_approval = min_layer_approval
         self.msb_window = msb_window
 
-    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        # 1. Trend (Katman 1 & Hard Constraint)
+    def _calculate(self, df: pd.DataFrame) -> pd.DataFrame:
+        # --- Trend ---
         df.ta.ema(length=9, append=True)
         df.ta.ema(length=21, append=True)
         df.ta.ema(length=50, append=True)
         df.ta.ema(length=200, append=True)
         df.ta.adx(length=14, append=True)
 
-        # 2. Momentum (Katman 2)
+        # --- Momentum ---
         df.ta.rsi(length=14, append=True)
         df.ta.macd(fast=12, slow=26, signal=9, append=True)
 
-        # 3. Volatilite (Risk AI Payload & Ek Bağlam)
+        # --- Volatility ---
         df.ta.atr(length=14, append=True)
         df.ta.bbands(length=20, std=2, append=True)
 
-        # 4. Hacim Doğrulaması (Katman 3)
+        # --- Volume ---
         df.ta.vwap(append=True)
-        # Hacim ortalaması hesaplama (Volume spike tespiti için)
-        df['volume_sma_20'] = df['volume'].rolling(window=20).mean()
+        df.ta.obv(append=True)
+        df["volume_sma_20"] = df["volume"].rolling(window=20).mean()
 
-        # 5. Basic Market Structure (Katman 4 - Vektörize Zirve/Dip ve MSB)
-        df['swing_high'] = df['high'].rolling(window=self.msb_window).max()
-        # Market Structure Break (BOS/MSB): Kapanışın bir önceki dönemin lokal zirvesini geçmesi
-        df['msb_bullish'] = df['close'] > df['swing_high'].shift(1)
+        # --- OBV ROC (14-period) ---
+        df["OBV_ROC_14"] = df["OBV"].pct_change(periods=14).fillna(0.0)
+
+        # --- Volume ROC (14-period) ---
+        df["VOLUME_ROC_14"] = df["volume"].pct_change(periods=14).fillna(0.0)
+
+        # --- Market Structure Break ---
+        df["swing_high"] = df["high"].rolling(window=self.msb_window).max()
+        df["msb_bullish"] = (df["close"] > df["swing_high"].shift(1)).astype(int)
 
         return df
 
-    def evaluate_long_logic(self, current_bar: pd.Series) -> tuple[int, int, float]:
-        """Sıfır Machine Learning, %100 Kurallı Karar Ağacı"""
-        
-        # Hard Constraint: ADX Filtresi
-        adx_value = current_bar.get('ADX_14', 0)
+    def _build_feature_vector(self, bar: pd.Series) -> MLFeatureVector:
+        close = bar["close"]
+
+        def safe_pct(val: float, base: float) -> float:
+            return round((val - base) / base, 6) if base != 0 else 0.0
+
+        bb_width = 0.0
+        bbu = bar.get("BBU_20_2.0", 0.0)
+        bbm = bar.get("BBM_20_2.0", 0.0)
+        bbl = bar.get("BBL_20_2.0", 0.0)
+        if bbm and bbm != 0.0:
+            bb_width = round((bbu - bbl) / bbm, 6)
+
+        return MLFeatureVector(
+            dist_ema9=safe_pct(bar.get("EMA_9", close), close),
+            dist_ema21=safe_pct(bar.get("EMA_21", close), close),
+            dist_ema50=safe_pct(bar.get("EMA_50", close), close),
+            dist_ema200=safe_pct(bar.get("EMA_200", close), close),
+            macd_hist_pct=safe_pct(bar.get("MACDh_12_26_9", 0.0) + close, close),
+            macd_line_pct=safe_pct(bar.get("MACD_12_26_9", 0.0) + close, close),
+            atr_pct=round(bar.get("ATRr_14", 0.0) / close, 6) if close else 0.0,
+            rsi=round(bar.get("RSI_14", 50.0), 4),
+            obv_roc=round(bar.get("OBV_ROC_14", 0.0), 6),
+            volume_roc=round(bar.get("VOLUME_ROC_14", 0.0), 6),
+            bb_width_pct=bb_width,
+            adx=round(bar.get("ADX_14", 0.0), 4),
+            vwap_dist=safe_pct(bar.get("VWAP_D", close), close),
+            msb_bullish=int(bar.get("msb_bullish", 0)),
+        )
+
+    def _evaluate_long(self, bar: pd.Series) -> tuple[int, int, float]:
+        adx_value = float(bar.get("ADX_14", 0.0))
+
+        # Hard gate — no trend, no trade
         if adx_value < self.adx_threshold:
-            return 0, 0, adx_value 
+            return 0, 0, adx_value
 
-        # Katman 1: Trend Onayı
-        layer1_trend = (current_bar['EMA_9'] > current_bar['EMA_21']) and (current_bar['close'] > current_bar['EMA_200'])
+        layer1 = bool(
+            bar["EMA_9"] > bar["EMA_21"] and bar["close"] > bar["EMA_200"]
+        )
+        layer2 = bool(
+            bar["RSI_14"] > 50 and bar["MACDh_12_26_9"] > 0
+        )
+        layer3 = bool(
+            bar["close"] > bar["VWAP_D"]
+            and bar["volume"] > bar["volume_sma_20"]
+        )
+        layer4 = bool(bar["msb_bullish"])
 
-        # Katman 2: Momentum Onayı
-        layer2_momentum = (current_bar['RSI_14'] > 50) and (current_bar['MACDh_12_26_9'] > 0)
+        active = int(layer1) + int(layer2) + int(layer3) + int(layer4)
+        signal = 1 if active >= self.min_layer_approval else 0
+        return signal, active, adx_value
 
-        # Katman 3: Hacim & Kurumsal İz Onayı
-        # Fiyat VWAP'ın üstünde ve mevcut mumun hacmi 20 periyotluk hacim ortalamasından yüksek
-        layer3_volume = (current_bar['close'] > current_bar['VWAP_D']) and (current_bar['volume'] > current_bar['volume_sma_20'])
+    def process_sync(
+        self, symbol: str, timeframe: str, df_raw: pd.DataFrame
+    ) -> tuple[TAConsensusPayload, MLFeatureVector]:
+        
+        # --- EARLY-EXIT ---
+        # ADX hesabı
+        adx_df = df_raw.ta.adx(length=14)
+        current_adx = float(adx_df.iloc[-1]['ADX_14']) if not adx_df.empty else 0.0
 
-        # Katman 4: Basic Market Structure
-        # Fiyat, geçmiş 20 periyodun lokal zirvesini kırmış olmalı (MSB/BOS)
-        layer4_structure = current_bar['msb_bullish']
+        # Eğer piyasa yataysa (Trend yoksa), ağır hesaplamaları atla
+        if current_adx < self.adx_threshold:
+            return self._build_empty_response(symbol, timeframe, current_adx)
 
-        active_layers = sum([layer1_trend, layer2_momentum, layer3_volume, layer4_structure])
-
-        # En az N katman onayı
-        signal = 1 if active_layers >= self.min_layer_approval else 0
-
-        return signal, active_layers, adx_value
-
-    async def process_market_data(self, symbol: str, timeframe: str, df_ohlcv: pd.DataFrame) -> TAConsensusPayload:
-        df = self.calculate_indicators(df_ohlcv)
+        # --- 2. ADIM: AĞIR HESAPLAMALAR ---
+        # Eğer buraya geldiysek piyasada trend vardır, tüm indikatörleri hesaplayabiliriz
+        df = self._calculate(df_raw.copy())
         df.dropna(inplace=True)
 
         if df.empty or len(df) < 2:
-            return TAConsensusPayload(
-                symbol=symbol, timeframe=timeframe, signal=0, confidence=0.0, 
-                adx_value=0.0, active_layers=0, atr_volatility=0.0
-            )
+            return self._build_empty_response(symbol, timeframe, current_adx)
 
-        current_bar = df.iloc[-1]
-        signal, active_layers, adx_val = self.evaluate_long_logic(current_bar)
-        
-        confidence = (active_layers / 4.0) if signal == 1 else 0.0
+        # Karar ve Feature Vector oluşturma
+        bar = df.iloc[-1]
+        signal, active_layers, adx_val = self._evaluate_long(bar)
+        fv = self._build_feature_vector(bar)
 
-        return TAConsensusPayload(
+        payload = TAConsensusPayload(
             symbol=symbol,
             timeframe=timeframe,
             signal=signal,
-            confidence=confidence,
+            confidence=round(active_layers / 4.0, 4) if signal == 1 else 0.0,
             adx_value=round(adx_val, 2),
             active_layers=active_layers,
-            atr_volatility=round(current_bar.get('ATRr_14', 0.0), 4)
+            atr_volatility=fv.atr_pct,
         )
+        return payload, fv
 
-# ---------------------------------------------------------
-# 4. KEDA / RABBITMQ WORKER ENTRY POINT
-# ---------------------------------------------------------
-async def ta_agent_worker(rabbitmq_message: dict) -> dict:
-    """
-    Azure Container App instance'ı ayağa kalktığında tetiklenen ana fonksiyon.
-    1. Veriyi çeker (I/O).
-    2. Modeli çalıştırır (CPU).
-    3. JSON'a dönüştürür ve Master Decision AI kuyruğuna iletmek üzere döner.
-    """
-    symbol = rabbitmq_message.get("symbol")
-    timeframe = rabbitmq_message.get("timeframe")
-    
-    # 1. Asenkron Data Fetch
+    def _build_empty_response(self, symbol: str, timeframe: str, adx: float) -> tuple[TAConsensusPayload, MLFeatureVector]:
+        payload = TAConsensusPayload(
+            symbol=symbol, timeframe=timeframe, signal=0, confidence=0.0,
+            adx_value=round(adx, 2), active_layers=0, atr_volatility=0.0
+        )
+        fv = MLFeatureVector(
+            dist_ema9=0.0, dist_ema21=0.0, dist_ema50=0.0, dist_ema200=0.0,
+            macd_hist_pct=0.0, macd_line_pct=0.0, atr_pct=0.0, rsi=50.0,
+            obv_roc=0.0, volume_roc=0.0, bb_width_pct=0.0, adx=round(adx, 2),
+            vwap_dist=0.0, msb_bullish=0
+        )
+        return payload, fv
+
+async def _connect_redis(url: str) -> redis.Redis:
+    client = redis.from_url(url, decode_responses=True)
+    await client.ping()
+    logger.info('"event":"REDIS_CONNECTED"')
+    return client
+
+
+async def _connect_rabbitmq(url: str, queue: str) -> tuple[aio_pika.RobustConnection, aio_pika.Channel]:
+    conn: aio_pika.RobustConnection = await aio_pika.connect_robust(url)
+    channel = await conn.channel()
+    await channel.set_qos(prefetch_count=10)
+    await channel.declare_queue(queue, durable=True)
+    logger.info(f'"event":"RABBITMQ_CONNECTED","queue":"{queue}"')
+    return conn, channel
+
+async def feature_engine_loop(symbol: str, timeframe: str) -> None:
+    redis_url = os.environ["REDIS_URL"]
+    rabbitmq_url = os.environ["RABBITMQ_URL"]
+    rabbitmq_queue = os.environ.get("RABBITMQ_QUEUE", "market_alerts")
+    trigger_cooldown_s = int(os.environ.get("TRIGGER_COOLDOWN_S", "60"))
+    poll_interval_s = int(os.environ.get("POLL_INTERVAL_S", "15"))
+
+    redis_client = await _connect_redis(redis_url)
+    rmq_conn, rmq_channel = await _connect_rabbitmq(rabbitmq_url, rabbitmq_queue)
+
     data_provider = YahooFinanceAsyncProvider()
-    raw_df = await data_provider.fetch_ohlcv(symbol, timeframe)
-    
-    if raw_df.empty or len(raw_df) < 200:
-        return {"error": "Insufficient data for EMA 200 or API limits hit.", "symbol": symbol}
-    
-    # 2. Vektörize Hesaplama ve Karar Mekanizması
-    agent = TechnicalAnalysisAgent(adx_threshold=20, min_layer_approval=3, msb_window=20)
-    ta_result_payload = await agent.process_market_data(symbol, timeframe, raw_df)
-    
-    # 3. Master Decision AI'a İletim Aşaması (Örn: aio_pika ile RabbitMQ Publish)
-    # await mq_channel.default_exchange.publish(
-    #    aio_pika.Message(body=ta_result_payload.model_dump_json().encode()),
-    #    routing_key="master_ai_consensus_queue"
-    # )
-    
-    return ta_result_payload.model_dump()
+    agent = TechnicalAnalysisAgent(
+        adx_threshold=int(os.environ.get("ADX_THRESHOLD", "20")),
+        min_layer_approval=int(os.environ.get("MIN_LAYER_APPROVAL", "3")),
+        msb_window=int(os.environ.get("MSB_WINDOW", "20")),
+    )
+
+    redis_key = f"model_features:{symbol.lower()}:{timeframe}"
+    lock_key = f"cooldown:master_trigger:{symbol.lower()}"
+
+    logger.info(f'"event":"LOOP_START","symbol":"{symbol}","timeframe":"{timeframe}"')
+
+    while True:
+        loop_start = time.monotonic()
+        try:
+            raw_df = await data_provider.fetch_ohlcv(symbol, timeframe)
+
+            if raw_df.empty or len(raw_df) < agent.MIN_ROWS:
+                logger.warning(
+                    f'"event":"INSUFFICIENT_DATA","symbol":"{symbol}",'
+                    f'"rows":{len(raw_df)},"required":{agent.MIN_ROWS}'
+                )
+            else:
+                ta_payload, feature_vec = await asyncio.to_thread(
+                    agent.process_sync, symbol, timeframe, raw_df
+                )
+                feature_dict = feature_vec.model_dump()
+                feature_dict["ta_signal"] = ta_payload.signal
+                feature_dict["ta_confidence"] = ta_payload.confidence
+                feature_dict["ta_active_layers"] = ta_payload.active_layers
+                feature_dict["ts"] = time.time()
+
+                await redis_client.set(redis_key, json.dumps(feature_dict), ex=300)
+
+                logger.info(
+                    f'"event":"FEATURES_WRITTEN","symbol":"{symbol}",'
+                    f'"signal":{ta_payload.signal},"adx":{ta_payload.adx_value},'
+                    f'"layers":{ta_payload.active_layers},"confidence":{ta_payload.confidence}'
+                )
+
+                if ta_payload.signal == 1:
+                    acquired = await redis_client.set(
+                        lock_key,
+                        "locked_by_ta_ai",
+                        ex=trigger_cooldown_s,
+                        nx=True, 
+                    )
+
+                    if acquired:
+                        trigger_payload = {
+                            "timestamp": time.time(),
+                            "event": "KEDA_TRIGGERED",
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "type": "TA_STRONG_SIGNAL",
+                            "details": {
+                                "confidence": ta_payload.confidence,
+                                "adx": ta_payload.adx_value,
+                                "active_layers": ta_payload.active_layers,
+                                "atr_pct": ta_payload.atr_volatility,
+                                "redis_key": redis_key,
+                            },
+                        }
+                        await rmq_channel.default_exchange.publish(
+                            aio_pika.Message(
+                                body=json.dumps(trigger_payload).encode(),
+                                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                            ),
+                            routing_key=rabbitmq_queue,
+                        )
+                        logger.warning(
+                            f'"event":"KEDA_TRIGGERED","symbol":"{symbol}",'
+                            f'"confidence":{ta_payload.confidence}'
+                        )
+                    else:
+                        logger.debug(
+                            f'"event":"TRIGGER_DROPPED","reason":"cooldown_active",'
+                            f'"symbol":"{symbol}"'
+                        )
+
+        except redis.RedisError as exc:
+            logger.error(f'"event":"REDIS_ERROR","error":"{exc}"')
+            # Reconnect on next iteration; don't crash the loop
+            try:
+                redis_client = await _connect_redis(redis_url)
+            except Exception:
+                pass
+        except aio_pika.exceptions.AMQPException as exc:
+            logger.error(f'"event":"RABBITMQ_ERROR","error":"{exc}"')
+            try:
+                rmq_conn, rmq_channel = await _connect_rabbitmq(rabbitmq_url, rabbitmq_queue)
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.error(f'"event":"LOOP_EXCEPTION","error":"{exc}"')
+
+        elapsed = time.monotonic() - loop_start
+        sleep_for = max(0.0, poll_interval_s - elapsed)
+        await asyncio.sleep(sleep_for)
 
 if __name__ == "__main__":
-    # Test için RabbitMQ'dan geliyormuş gibi sahte bir mesaj oluşturuyoruz
-    test_msg = {"symbol": "BTCUSDT", "timeframe": "15m"}
-    
-    # Asenkron fonksiyonu ayağa kaldırıyoruz
-    result = asyncio.run(ta_agent_worker(test_msg))
-    
-    # Master AI'a gidecek olan nihai JSON payload'u ekrana yazdırıyoruz
-    import json
-    print(json.dumps(result, indent=4))
+    _symbol = os.environ.get("SYMBOL", "BTCUSDT")
+    _timeframe = os.environ.get("TIMEFRAME", "15m")
+
+    try:
+        asyncio.run(feature_engine_loop(_symbol, _timeframe))
+    except KeyboardInterrupt:
+        logger.info('"event":"SHUTDOWN","reason":"KeyboardInterrupt"')

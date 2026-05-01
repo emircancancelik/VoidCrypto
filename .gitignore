@@ -1,0 +1,77 @@
+### --- Python Temelleri ---
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+### --- Projeye Özel (VoidCrypto) ---
+# Veri klasörünü ve büyük CSV/JSON dosyalarını hariç tut
+# (Eğer veri setlerini repoda tutmak istemiyorsan)
+py_projects/VoidCrypto/VoidCrypto/data/*.csv
+py_projects/VoidCrypto/VoidCrypto/data/*.json
+py_projects/VoidCrypto/VoidCrypto/data/*.log
+
+# Model ağırlıkları (Deep Learning ajanları için)
+*.pt
+*.pth
+*.onnx
+*.h5
+
+### --- Azure & Dağıtık Sistemler ---
+.azure/
+.funcignore
+.serverless/
+# Redis ve RabbitMQ yerel logları
+*.rdb
+*.aof
+
+### --- macOS (M4 MacBook Air Özel) ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+### --- IDE & Editörler ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+### --- Loglar ve Geçici Dosyalar ---
+logs/
+*.log
+tmp/
+temp/
+py_projects/VoidCrypto/data/raw/*.csv
+
+# Veri dosyalarını engelle (50MB+ uyarısı almamak için)
+*.csv
+*.parquet
+data/raw/
+
+# Python ve OS gereksizleri
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv_voidcrypto/
+.ipynb_checkpoints/
+.vscode/
+
+# Diğer projelerin bu repoya sızmasını engelle
+../
+alaz-solar-alert/
+STM32Cube/
+cs_projects/
+voidpos/venv_voidcrypto/
+.DS_Store
+.vscode/
+__pycache__/

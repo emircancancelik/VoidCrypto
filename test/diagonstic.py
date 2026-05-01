@@ -151,5 +151,3 @@ for thresh_4h in [0.50, 0.52, 0.55, 0.58, 0.60]:
         cnt = mask_sc.sum()
         if 10 <= cnt <= 500:  # makul aralık
             print(f"  CONF_4H={thresh_4h}  SCORE>={thresh_sc:2d}  → {cnt} işlem")
-
-print("\n  (Çıktıyı kopyalayıp paylaş — parametreleri buna göre ayarlayalım)\n")
