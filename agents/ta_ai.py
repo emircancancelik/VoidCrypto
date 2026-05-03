@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -11,7 +13,6 @@ import redis.asyncio as redis
 
 from typing import Optional
 from pydantic import BaseModel, Field
-from __future__ import annotations
 
 
 logging.basicConfig(

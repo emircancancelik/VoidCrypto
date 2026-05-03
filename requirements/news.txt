@@ -1,0 +1,4 @@
+-r base.txt
+aiohttp>=3.9.3
+feedparser>=6.0.11
+numpy>=1.26.0

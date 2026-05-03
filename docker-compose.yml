@@ -1,3 +1,5 @@
+version: "3.8"
+
 services:
   # ---------------------------------------------------------
   # 1. ALTYAPI: REDIS & RABBITMQ
@@ -8,62 +10,94 @@ services:
     ports:
       - "6379:6379"
     restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   rabbitmq-service:
     image: rabbitmq:3-management-alpine
     container_name: voidcrypto-rabbitmq
     ports:
-      - "5672:5672"   # AMQP
-      - "15672:15672" # Yönetim Arayüzü (guest/guest)
+      - "5672:5672"
+      - "15672:15672"
     restart: always
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 10s # Timeout süresi 10sn'ye çıkarıldı (M4 Mac'te ayağa kalkma payı)
+      retries: 5
 
   # ---------------------------------------------------------
   # 2. SÜREKLİ ÇALIŞAN (CONTINUOUS) AJANLAR
   # ---------------------------------------------------------
   order-book-ai:
-    build: .
+    build:
+      context: .
+      args:
+        REQ_FILE: order_book.txt
+        AGENT_SCRIPT: order_book_ai.py
     platform: linux/amd64
     container_name: voidcrypto-order-book
-    command: python -u agents/order_book_ai.py
     depends_on:
-      - redis-service
-      - rabbitmq-service
+      redis-service:
+        condition: service_healthy
+      rabbitmq-service:
+        condition: service_healthy # RabbitMQ ping'i dönmeden konteyner ASLA kalkmaz
     ports:
-      - "8001:8001"
+      - "8055:8055" # [Errno 98] çakışmasını kökünden çözmek için 8001 -> 8055'e çekildi
     environment:
       - REDIS_URL=redis://redis-service:6379/0
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq-service:5672/
-      - METRICS_PORT=8001
+      - METRICS_PORT=8055 # Koddaki port da buradan ezilecek
       - SYMBOL=btcusdt
       - TRIGGER_COOLDOWN_S=5.0
-    restart: always
+    restart: on-failure
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 5s # Ölümcül: Restart atarken OS portu bıraksın diye 5sn bekleme
+        max_attempts: 10
+        window: 120s
 
   ta-ai:
-    build: .
+    build:
+      context: .
+      args:
+        REQ_FILE: ta.txt
+        AGENT_SCRIPT: ta_ai.py
     platform: linux/amd64
     container_name: voidcrypto-ta
-    command: python -u agents/ta_ai.py
     depends_on:
-      - redis-service
-      - rabbitmq-service
+      redis-service:
+        condition: service_healthy
+      rabbitmq-service:
+        condition: service_healthy
     environment:
       - REDIS_URL=redis://redis-service:6379/0
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq-service:5672/
       - RABBITMQ_QUEUE=market_alerts
       - SYMBOL=BTCUSDT
+      - NUMBA_CACHE_DIR=/tmp
     restart: always
 
   # ---------------------------------------------------------
   # 3. İSTİHBARAT (JOB & WORKER) AJANLARI
   # ---------------------------------------------------------
   whale-tracker-ai:
-    build: .
+    build:
+      context: .
+      args:
+        REQ_FILE: base.txt
+        AGENT_SCRIPT: whale_tracker_ai.py
     platform: linux/amd64
     container_name: voidcrypto-whale
-    command: python -u agents/whale_tracker_ai.py
     depends_on:
-      - redis-service
-      - rabbitmq-service
+      redis-service:
+        condition: service_healthy
+      rabbitmq-service:
+        condition: service_healthy
     environment:
       - REDIS_URL=redis://redis-service:6379/0
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq-service:5672/
@@ -73,44 +107,69 @@ services:
     restart: on-failure
 
   news-worker:
-    build: .
-    platform: linux/amd64
+    build:
+      context: .
+      args:
+        REQ_FILE: news.txt
+        AGENT_SCRIPT: news_ai.py
     container_name: voidcrypto-news-worker
-    command: python -u agents/news_ai.py
     depends_on:
-      - redis-service
+      redis-service:
+        condition: service_healthy
+      rabbitmq-service:
+        condition: service_healthy
     environment:
       - REDIS_URL=redis://redis-service:6379/0
-      - RUN_MODE=once 
+      - RUN_MODE=cycle
     restart: on-failure
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 5s
 
   # ---------------------------------------------------------
   # 4. MAKİNE ÖĞRENMESİ (ML) AJANLARI
   # ---------------------------------------------------------
   ml-price-action-ai:
-    build: .
+    build:
+      context: .
+      args:
+        REQ_FILE: ml.txt
+        AGENT_SCRIPT: ml_priceaction_ai.py
     platform: linux/amd64
     container_name: voidcrypto-ml-price
-    command: python -u agents/ml_priceaction_ai.py
     depends_on:
-      - redis-service
+      redis-service:
+        condition: service_healthy
+      rabbitmq-service:
+        condition: service_healthy
     environment:
       - REDIS_URL=redis://redis-service:6379/0
-      - MODEL_LONG_PATH=/app/models/ml_action_long.json
-      - MODEL_SHORT_PATH=/app/models/ml_action_short.json
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq-service:5672/
+      - REQUEST_QUEUE_KEY=ml_price_action_requests
+      - MODEL_LONG_PATH=/app/agents/void_model_15m_long.json # Yollar /app köküyle belirtilmeli
+      - MODEL_SHORT_PATH=/app/agents/void_model_15m_short.json
+      - CALIBRATOR_PATH=/app/agents/void_calibrator_15m.pkl
+    volumes:
+      - .:/app
     restart: always
 
   # ---------------------------------------------------------
   # 5. KARAR VE İCRA (MASTER & RISK) AJANLARI
   # ---------------------------------------------------------
   master-ai:
-    build: .
-    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        REQ_FILE: master.txt
+        AGENT_SCRIPT: master_decision_ai.py
     container_name: voidcrypto-master
-    command: python -u agents/master_decision_ai.py
     depends_on:
-      - redis-service
-      - rabbitmq-service
+      redis-service:
+        condition: service_healthy
+      rabbitmq-service:
+        condition: service_healthy
     ports:
       - "9090:9090"
     environment:
@@ -118,17 +177,26 @@ services:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq-service:5672/
       - CONSUME_QUEUE=market_alerts
       - METRICS_PORT=9090
+    volumes:
+      - .:/app
     restart: always
 
   risk-execution-ai:
-    build: .
+    build:
+      context: .
+      args:
+        REQ_FILE: execution.txt
+        AGENT_SCRIPT: risk_agent.py
     platform: linux/amd64
     container_name: voidcrypto-risk
-    command: python -u agents/risk_agent.py
     depends_on:
-      - redis-service
+      redis-service:
+        condition: service_healthy
+      rabbitmq-service:
+        condition: service_healthy
     environment:
       - REDIS_URL=redis://redis-service:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq-service:5672/
       - BINANCE_API_KEY=${BINANCE_API_KEY}
       - BINANCE_SECRET=${BINANCE_SECRET}
     restart: always

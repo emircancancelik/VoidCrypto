@@ -1,0 +1,18 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: ml-priceaction-scaler
+  namespace: voidcrypto
+spec:
+  scaleTargetRef:
+    name: ml-priceaction-deployment
+  pollingInterval: 1  # HFT için saniyede 1 kontrol (Gecikmeyi önler)
+  cooldownPeriod: 30  # Konteyneri sıcak tutmak için 30 sn bekle
+  minReplicaCount: 0  # Scale-to-Zero maliyet optimizasyonu
+  maxReplicaCount: 10 # Yoğun trafikte paralel işleme
+  triggers:
+  - type: rabbitmq
+    metadata:
+      queueName: ml_analysis_queue 
+      queueLength: "5" 
+      host: RabbitMqConnectionString

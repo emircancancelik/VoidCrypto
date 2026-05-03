@@ -1,0 +1,4 @@
+-r base.txt
+pandas>=2.2.0
+numpy>=1.26.0
+pandas-ta==0.4.71b0

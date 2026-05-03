@@ -1,17 +1,18 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import time
 import re
+from dataclasses import dataclass, asdict
+from typing import Optional
+
 import aiohttp
 import feedparser
 import numpy as np
 import redis.asyncio as redis
-
-from __future__ import annotations
-from dataclasses import dataclass, asdict
-from typing import Optional
 
 try:
     import importlib.util
@@ -438,36 +439,46 @@ class BackgroundIngestionWorker:
             f'"articles":{record.article_count},'
             f'"backend":"{record.backend}"'
         )
+        if self._redis is None:
+            logger.error("Redis baglantisi yok, yazma islemi iptal edildi.")
+            return
 
     # ── Main Cycle ─────────────────────────────────────────────────────────────
     async def run_cycle(self) -> None:
-        """Tek bir ingestion döngüsü: fetch → infer → write."""
-        cycle_start = time.monotonic()
-        logger.info('"Ingestion döngüsü başlıyor."')
+        if self._redis is None:
+            logger.warning("redis_not_connected: Re-attempting connection...")
+            await self.connect()
+            if self._redis is None:
+                logger.error("redis_connection_failed: Skipping cycle.")
+                return
 
-        all_texts = await self._fetch_all_feeds()
-        logger.info(f'"Toplam ham metin: {len(all_texts)}"')
+            cycle_start = time.monotonic()
+            logger.info("ingestion_cycle_started")
 
-        write_tasks = []
-        for symbol in Config.WATCHED_SYMBOLS:
-            filtered = self._filter_texts_for_symbol(all_texts, symbol)
-            nlp_score, confidence, _raw_conf = self._compute_symbol_sentiment(filtered, symbol)
+            all_texts = await self._fetch_all_feeds()
+            logger.info(f"raw_text_count: {len(all_texts)}")
 
-            record = SentimentRecord(
-                symbol           = symbol,
-                nlp_score        = nlp_score,
-                calibrated_score = nlp_score,   # ek kalibrasyon katmanı eklenirse ayrıştırılır
-                confidence       = confidence,
-                article_count    = len(filtered),
-                updated_at       = time.time(),
-                backend          = self._backend.backend_name,
-            )
-            write_tasks.append(self._write_to_redis(record))
+            write_tasks = []
+            for symbol in Config.WATCHED_SYMBOLS:
+                filtered = self._filter_texts_for_symbol(all_texts, symbol)
+                nlp_score, confidence, _raw_conf = self._compute_symbol_sentiment(filtered, symbol)
 
-        await asyncio.gather(*write_tasks)
+                record = SentimentRecord(
+                    symbol           = symbol,
+                    nlp_score        = nlp_score,
+                    calibrated_score = nlp_score,
+                    confidence       = confidence,
+                    article_count    = len(filtered),
+                    updated_at       = time.time(),
+                    backend          = self._backend.backend_name,
+                )
+                write_tasks.append(self._write_to_redis(record))
 
-        elapsed = time.monotonic() - cycle_start
-        logger.info(f'"Döngü tamamlandı. Süre: {elapsed:.2f}s"')
+            if write_tasks:
+                await asyncio.gather(*write_tasks)
+
+            elapsed = time.monotonic() - cycle_start
+            logger.info(f"cycle_complete_duration: {elapsed:.2f}s")
 
 class NewsSentimentAgent:
     """
@@ -602,15 +613,18 @@ async def news_sentiment_node(state: dict) -> dict:
 
     return {**state, "news_sentiment": asdict(output)}
 
-async def run_once(self) -> None:
+async def main_worker():
+    worker = BackgroundIngestionWorker()
+    await worker.connect()
+    
     try:
-        await self.connect()
-        await self.run_cycle()
+        while True:
+            await worker.run_cycle()
+            await asyncio.sleep(Config.INGESTION_INTERVAL_SEC)
     except Exception as e:
-        logger.error(f'"Job hatası: {e}"')
+        logger.error(f"Kritik Worker Hatası: {e}")
     finally:
-        await self.disconnect()
+        await worker.disconnect()
 
 if __name__ == "__main__":
-    worker = BackgroundIngestionWorker()
-    asyncio.run(worker.run_once())
+    asyncio.run(main_worker())

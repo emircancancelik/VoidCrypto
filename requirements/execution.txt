@@ -1,0 +1,3 @@
+-r base.txt
+ccxt>=4.2.59
+numpy>=1.26.0

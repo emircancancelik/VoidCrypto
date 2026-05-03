@@ -1,50 +1,56 @@
-# Builder Stage
-FROM python:3.11-slim-bookworm AS builder
+# ── Aşama 1: Builder ─────────────────────────────────────────────────────────
+# Tek bir Python sürümü tanımlıyoruz ki aşağıda çatışma olmasın
+ARG PYTHON_VERSION=3.12
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
+
+# Gereksiz önbellekleri kapat, performansı artır
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /build
 
-# Pip işlemlerinden önce git ve build-essential kurmak ZORUNDASIN
+# C derleyicileri (Numpy/Pandas için gerekli olabilir ama Git'e artık gerek yok)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+# DİNAMİK BAĞIMLILIK SEÇİMİ (Burası mimarinin kalbi)
+# Compose dosyasından hangi ajanı inşa ediyorsak onun .txt'si gelecek
+ARG REQ_FILE=base.txt
 
+# Önce base.txt, sonra hedef ajanın gereksinim dosyası
+COPY requirements/base.txt requirements/
+COPY requirements/${REQ_FILE} requirements/
+
+# Seçilen gereksinimleri /install dizinine kur
 RUN pip install --upgrade pip \
-    && pip install --no-cache-dir --prefix=/install -r requirements.txt
+    && pip install --no-cache-dir --prefix=/install -r requirements/${REQ_FILE}
 
 # ── Aşama 2: Runtime (Üretim Katmanı) ────────────────────────────────────────
-FROM python:3.11-slim-bookworm AS runtime
+FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 
-# Güvenlik: Root olmayan kullanıcı kullanımı
+# Güvenlik: Root olmayan kullanıcı
 RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
 
 WORKDIR /app
 
-# Sadece yüklü paketleri kopyala (İmaj boyutunu düşürür)
+# Sadece derlenmiş paketleri builder'dan kopyala
 COPY --from=builder /install /usr/local
 
-# Proje dosyalarını ve modelleri kopyala
-# Not: .dockerignore dosyan varsa gereksiz dosyalar (venv, __pycache__) elenir.
+# Proje kodlarını kopyala
 COPY agents/ ./agents/
-COPY models/ ./models/
 
-# Yetkilendirme
 RUN chown -R appuser:appgroup /app
 
-# Çevresel Değişkenler
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    HTTP_PORT=8080
+    PYTHONUNBUFFERED=1
 
 USER appuser
 
-# Health Check: Ajanın yaşadığını doğrula
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen(f'http://localhost:{os.getenv(\"HTTP_PORT\", \"8080\")}/healthz')"
+# Hangi ajanın başlatılacağını çevresel değişkenle alıyoruz
+ARG AGENT_SCRIPT=master_decision_ai.py
+ENV RUN_SCRIPT=agents/${AGENT_SCRIPT}
 
-EXPOSE 8080
-
-# Varsayılan olarak Master AI'ı başlat (Diğer ajanlar compose/yaml ile ezilir)
-CMD ["python", "-u", "agents/master_decision_ai.py"]
+# Çalıştır
+CMD ["sh", "-c", "python -u ${RUN_SCRIPT}"]

@@ -38,15 +38,15 @@ class Config:
     CONSUME_QUEUE       = _env("CONSUME_QUEUE",       "market_alerts")
     EXECUTION_QUEUE     = _env("EXECUTION_QUEUE",     "execution_orders")
     DLQ_NAME            = _env("DLQ_NAME",            "market_alerts.dlq")
-    AUDITOR_RESULT_TTL  = int(_env("AUDITOR_RESULT_TTL", "0.5"))      # seconds to wait for auditor
+    AUDITOR_RESULT_TTL  = float(_env("AUDITOR_RESULT_TTL", "0.5"))      # seconds to wait for auditor 
     CONFIDENCE_THRESHOLD= float(_env("CONFIDENCE_THRESHOLD", "0.60"))
     ECE_THRESHOLD       = float(_env("ECE_THRESHOLD",  "0.05"))     # max allowed ECE
     ATR_CONFIDENCE_RATIO= float(_env("ATR_CONFIDENCE_RATIO", "2.0"))# confidence must be ≥ ratio×normalised_ATR
     METRICS_PORT        = int(_env("METRICS_PORT",    "9090"))
     CB_FAILURE_LIMIT    = int(_env("CB_FAILURE_LIMIT","5"))          # circuit breaker trip threshold
     CB_RESET_SECONDS    = int(_env("CB_RESET_SECONDS","30"))
-    MODEL_LONG_PATH     = _env("MODEL_LONG_PATH",  str(BASE_DIR / "data/processed/void_model_15m_long.json"))
-    MODEL_SHORT_PATH    = _env("MODEL_SHORT_PATH", str(BASE_DIR / "data/processed/void_model_15m_short.json"))
+    MODEL_LONG_PATH     = _env("MODEL_LONG_PATH",  str(BASE_DIR / "agents/void_model_15m_long.json"))
+    MODEL_SHORT_PATH    = _env("MODEL_SHORT_PATH", str(BASE_DIR / "agents/void_model_15m_short.json"))
 
 EXPECTED_FEATURES = [
     "dist_ema9", "dist_ema21", "dist_ema50", "dist_ema200",

@@ -1,0 +1,3 @@
+-r base.txt
+certifi>=2024.2.2
+prometheus-client>=0.20.0

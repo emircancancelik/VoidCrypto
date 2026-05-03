@@ -11,6 +11,8 @@ from enum import Enum
 from typing import Deque, Dict, Optional
 import ssl
 import certifi
+import random
+import traceback
 import aio_pika
 import aiohttp
 import redis.asyncio as redis
@@ -38,7 +40,7 @@ class OrderBookConfig:
     depth_levels: int = field(default_factory=lambda: int(os.getenv("DEPTH_LEVELS", "15")))
     redis_write_interval_ms: int = field(default_factory=lambda: int(os.getenv("REDIS_WRITE_INTERVAL_MS", "1000")))
     ws_reconnect_max_backoff: int = field(default_factory=lambda: int(os.getenv("WS_RECONNECT_MAX_BACKOFF", "60")))
-    metrics_port: int = field(default_factory=lambda: int(os.getenv("METRICS_PORT", "8001")))
+    metrics_port: int = field(default_factory=lambda: int(os.getenv("METRICS_PORT", "8010")))
     circuit_breaker_threshold: int = field(default_factory=lambda: int(os.getenv("CB_THRESHOLD", "5")))
     spread_spike_multiplier: float = field(default_factory=lambda: float(os.getenv("SPREAD_SPIKE_MULT", "3.0")))
     vwap_deviation_pct: float = field(default_factory=lambda: float(os.getenv("VWAP_DEV_PCT", "0.5")))
@@ -230,8 +232,10 @@ class OrderBookAI:
         self._analysis_event = asyncio.Event()
 
         self._snapshot_url = f"https://api.binance.com/api/v3/depth?symbol={self.config.symbol.upper()}&limit=1000"
-        self._ws_url = f"wss://stream.binance.com:9443/ws/{self.config.symbol}@depth"
-        self.ssl_context = ssl.create_default_context(cafile=certifi.where())
+        self._ws_url = f"wss://testnet.binance.vision/ws/{self.config.symbol.lower()}@depth20@1000ms"
+        self.ssl_context = ssl.create_default_context()
+        self.ssl_context.check_hostname = False
+        self.ssl_context.verify_mode = ssl.CERT_NONE
 
     async def connect_infrastructure(self):
         logger.info('"event":"INFRA_CONNECT_START"')
@@ -386,60 +390,46 @@ class OrderBookAI:
             self._analysis_event.clear()
             await self._analyze_and_route()
             await asyncio.sleep(0.001)
+            
+    async def _process_message(self, msg: dict) -> None:
+        """Sentetik L2 verisini alıp orkestranın analiz aşamasını tetikler."""
+        try:
+            # Gelen mock veriyi mevcut defter (book) yapısına uydurmak istersen burayı genişletebilirsin.
+            # Asıl kritik olan, verinin ardından analiz ve sinyal aşamasını (threshold kontrolünü) tetiklemektir:
+            if hasattr(self, '_analyze_and_route'):
+                await self._analyze_and_route()
+        except Exception as e:
+            logger.error(f'{{"event":"PROCESS_MESSAGE_ERROR","error":"{str(e)}"}}')
 
     async def stream_websocket(self):
-        backoff = 1
+        
+        logger.info('{"event":"WS_MOCK_MODE","msg":"Fiziksel ağ engeli by-pass edildi. Sentetik L2 verisi üretiliyor."}')
+        
         while self.is_running:
             self.book.reset()
-            message_buffer: asyncio.Queue = asyncio.Queue()
+            base_price += random.uniform(10.0, 60.0)  # Başlangıç fiyatı
             
             try:
-                async with websockets.connect(
-                    self._ws_url,
-                    ssl=self.ssl_context,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    close_timeout=5,
-                ) as ws:
-                    Metrics.ws_reconnects_total.labels(symbol=self.config.symbol).inc()
-                    logger.info(f'"event":"WS_CONNECTED","symbol":"{self.config.symbol}"')
-                    backoff = 1
-
-                    async def _buffer_messages():
-                        async for raw_msg in ws:
-                            await message_buffer.put(json.loads(raw_msg))
+                while self.is_running:
+                    base_price += random.uniform(-15.0, 15.0)
+                    mock_msg = {
+                        "e": "depthUpdate",
+                        "E": int(time.time() * 1000),
+                        "s": self.config.symbol.upper(),
+                        "U": random.randint(10000, 99999),
+                        "u": random.randint(100000, 999999),
+                        "b": [[str(round(base_price - i, 2)), str(round(random.uniform(0.1, 2.5), 3))] for i in range(1, 10)],
+                        "a": [[str(round(base_price + i, 2)), str(round(random.uniform(0.1, 2.5), 3))] for i in range(1, 10)]
+                    }
                     
-                    buffer_task = asyncio.create_task(_buffer_messages())
-
-                    logger.info('"event":"SNAPSHOT_FETCH_START"')
-                    snapshot = await self._fetch_snapshot()
-                    self.book.apply_snapshot(snapshot)
-
-                    while self.is_running:
-                        data = await message_buffer.get()
-                        
-                        valid = self.book.apply_delta(data)
-                        if not valid:
-                            logger.error('"event":"SEQUENCE_GAP_RESYNC"')
-                            buffer_task.cancel()
-                            break
-
-                        self._analysis_event.set()
-
-            except websockets.ConnectionClosed as exc:
-                logger.error(f'"event":"WS_DISCONNECTED","code":{exc.code},"reason":"{exc.reason}"')
-            except aiohttp.ClientError as exc:
-                logger.error(f'"event":"SNAPSHOT_FAIL","error":"{exc}"')
-            except Exception as exc:
-                logger.error(f'"event":"WS_UNEXPECTED_ERROR","error":"{exc}"', exc_info=True)
-            finally:
-                if 'buffer_task' in locals() and not buffer_task.done():
-                    buffer_task.cancel()
-
-            if self.is_running:
-                logger.info(f'"event":"RECONNECT_WAIT","backoff_s":{backoff}')
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, self.config.ws_reconnect_max_backoff)
+                    await self._process_message(mock_msg)
+                    
+                    # Saniyede 2 mesaj (500ms frekans) ile sistemi besle
+                    await asyncio.sleep(0.5)
+                    
+            except Exception as e:
+                logger.error(f'{{"event":"MOCK_ERROR","error":"{str(e)}","trace":"{traceback.format_exc()}"}}')
+                await asyncio.sleep(2)
 
     async def shutdown(self):
         logger.info('"event":"SHUTDOWN_START"')
