@@ -401,35 +401,46 @@ class OrderBookAI:
         except Exception as e:
             logger.error(f'{{"event":"PROCESS_MESSAGE_ERROR","error":"{str(e)}"}}')
 
-    async def stream_websocket(self):
+    async def stream_websocket(self) -> None:
+        """
+        Binance canlı veri akışına bağlanır. 
+        Hata durumunda exponential backoff ile yeniden bağlanma sağlar.
+        """
+        import ssl
+        import certifi
+        import websockets
+
+        # Production WebSocket URL
+        self._ws_url = f"wss://stream.binance.com:9443/ws/{self.config.symbol.lower()}@depth20@100ms"
         
-        logger.info('{"event":"WS_MOCK_MODE","msg":"Fiziksel ağ engeli by-pass edildi. Sentetik L2 verisi üretiliyor."}')
+        # SSL Sertifika Doğrulaması (Production-ready)
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
         
+        backoff_sec = 1
+        max_backoff = 60
+
         while self.is_running:
-            self.book.reset()
-            base_price += random.uniform(10.0, 60.0)  # Başlangıç fiyatı
-            
             try:
-                while self.is_running:
-                    base_price += random.uniform(-15.0, 15.0)
-                    mock_msg = {
-                        "e": "depthUpdate",
-                        "E": int(time.time() * 1000),
-                        "s": self.config.symbol.upper(),
-                        "U": random.randint(10000, 99999),
-                        "u": random.randint(100000, 999999),
-                        "b": [[str(round(base_price - i, 2)), str(round(random.uniform(0.1, 2.5), 3))] for i in range(1, 10)],
-                        "a": [[str(round(base_price + i, 2)), str(round(random.uniform(0.1, 2.5), 3))] for i in range(1, 10)]
-                    }
+                async with websockets.connect(
+                    self._ws_url,
+                    ssl=ssl_context,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=5
+                ) as ws:
+                    logger.info(f"event: WS_CONNECTED symbol: {self.config.symbol}")
+                    backoff_sec = 1 
                     
-                    await self._process_message(mock_msg)
-                    
-                    # Saniyede 2 mesaj (500ms frekans) ile sistemi besle
-                    await asyncio.sleep(0.5)
-                    
+                    async for raw_msg in ws:
+                        msg = json.loads(raw_msg)
+                        await self._process_message(msg)
+                        
             except Exception as e:
-                logger.error(f'{{"event":"MOCK_ERROR","error":"{str(e)}","trace":"{traceback.format_exc()}"}}')
-                await asyncio.sleep(2)
+                logger.error(f"event: WS_CONNECTION_ERROR error_type: {type(e).__name__} detail: {str(e)}")
+                if self.is_running:
+                    logger.info(f"event: WS_RECONNECT_ATTEMPT delay_sec: {backoff_sec}")
+                    await asyncio.sleep(backoff_sec)
+                    backoff_sec = min(backoff_sec * 2, max_backoff)
 
     async def shutdown(self):
         logger.info('"event":"SHUTDOWN_START"')
